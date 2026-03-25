@@ -1,0 +1,53 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+.DS_Store
+*.idea/
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# VSCode files
+*.code-workspace
+.vscode
+
+# generated proto files
+*.pb.go
+
+# golang vendor directory
+vendor
+.vendor-new
+
+# data directory
+data
+
+tests/*.xlsx
+
+# temporary file generated during build
+build
+
+# gRPC generated client stubs
+client/php/lib
+client/golang/proto
+
+
+# protoc-gen repo
+protoc-gen
+
+*.env
+
+# delve debugger artifact
+__debug_bin
+
+# volumes during local builds
+volume
+
+token.json
+
+./mock-generator.sh
