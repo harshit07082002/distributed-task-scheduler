@@ -1,5 +1,5 @@
 task-scheduler:
-  port: 8080
+  port: 8000
   name: "task-scheduler"
   poll_interval: 200
 

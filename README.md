@@ -1,12 +1,12 @@
 # Distributed Task Scheduler in Go
 
-A production-ready, distributed task scheduling system built in Go — featuring a priority queue, worker pool, cron support, retries with exponential backoff, and a REST API.
+A production-ready, distributed task scheduling system built in Go — featuring a priority queue, worker pool, cron support, retries with exponential backoff, Redis-backed persistence, and a REST API.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        REST API (port 8080)                     │
+│                        REST API (port 8000)                     │
 │  POST /api/tasks  GET /api/tasks  GET /api/stats  DELETE /...   │
 └────────────────────────────┬────────────────────────────────────┘
                              │
@@ -36,8 +36,8 @@ A production-ready, distributed task scheduling system built in Go — featuring
 └────────────────────────────┬────────────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────────────┐
-│               Task Store (Memory + JSON Persistence)            │
-│                      data/tasks.json                            │
+│                      Redis Task Store                           │
+│            (task metadata + sorted-set queue)                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -53,8 +53,7 @@ A production-ready, distributed task scheduling system built in Go — featuring
 | **Task Dependencies** | Task A can depend on Task B completing first |
 | **Timeouts** | Per-task execution timeouts |
 | **REST API** | Full CRUD API with filtering, stats, and health check |
-| **Persistence** | JSON file persistence; tasks survive restarts |
-| **Recovery** | In-flight tasks re-queued on startup |
+| **Redis Persistence** | Tasks stored in Redis; survive restarts |
 | **Hooks** | `OnTaskComplete` / `OnTaskFail` callbacks |
 | **Tagging** | Tag tasks for grouping and filtering |
 
@@ -63,24 +62,61 @@ A production-ready, distributed task scheduling system built in Go — featuring
 ### Prerequisites
 
 - Go 1.22+
+- Redis 7+
 
-### Run
+### Option A — Docker Compose (recommended)
 
 ```bash
 git clone <repo>
 cd distributed-task-scheduler
+docker-compose up
+```
+
+The API will be available at **http://localhost:8080**.
+
+### Option B — Run locally
+
+```bash
+git clone <repo>
+cd distributed-task-scheduler
+
+# Start Redis (if not already running)
+docker run -d -p 6379:6379 redis:7-alpine
+
 go mod tidy
 go run .
 ```
 
-The server starts on **http://localhost:8080** and submits several demo tasks automatically.
+The API will be available at **http://localhost:8000**.
+
+### Configuration
+
+Edit `configs/config.yaml` to change the port, poll interval, or Redis connection:
+
+```yaml
+task-scheduler:
+  port: 8000
+  poll_interval: 200   # milliseconds
+
+redis_client:
+  host: "localhost"
+  port: "6379"
+  password: ""
+  db: 0
+```
 
 ## API Reference
+
+### Health Check
+
+```bash
+curl http://localhost:8000/api/health
+```
 
 ### Submit a Task
 
 ```bash
-curl -X POST http://localhost:8080/api/tasks \
+curl -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Send Welcome Email",
@@ -100,7 +136,7 @@ curl -X POST http://localhost:8080/api/tasks \
 ### Schedule a Future Task
 
 ```bash
-curl -X POST http://localhost:8080/api/tasks \
+curl -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Monthly Report",
@@ -113,7 +149,7 @@ curl -X POST http://localhost:8080/api/tasks \
 ### Create a Recurring Cron Task
 
 ```bash
-curl -X POST http://localhost:8080/api/tasks \
+curl -X POST http://localhost:8000/api/tasks \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Daily Cleanup",
@@ -127,28 +163,28 @@ curl -X POST http://localhost:8080/api/tasks \
 
 ```bash
 # All tasks
-curl http://localhost:8080/api/tasks
+curl http://localhost:8000/api/tasks
 
 # Filter by status: pending | running | completed | failed | retrying | cancelled
-curl "http://localhost:8080/api/tasks?status=completed"
+curl "http://localhost:8000/api/tasks?status=completed"
 ```
 
 ### Get Task Details
 
 ```bash
-curl http://localhost:8080/api/tasks/{task_id}
+curl http://localhost:8000/api/tasks/{task_id}
 ```
 
 ### Cancel a Task
 
 ```bash
-curl -X DELETE http://localhost:8080/api/tasks/{task_id}
+curl -X DELETE http://localhost:8000/api/tasks/{task_id}
 ```
 
 ### Scheduler Stats
 
 ```bash
-curl http://localhost:8080/api/stats
+curl http://localhost:8000/api/stats
 ```
 
 ## Cron Expression Format
@@ -184,6 +220,18 @@ PriorityNormal = 5  // default
 PriorityHigh   = 10
 ```
 
+## Built-in Task Types
+
+Registered in `main.go` out of the box:
+
+| Type | Description |
+|---|---|
+| `email_notification` | Simulates sending an email (`to`, `subject`) |
+| `report_generation` | Simulates report creation (`report_type`) — 20% failure rate for retry demo |
+| `data_export` | Simulates data export (`format`) |
+| `cache_warmup` | Simulates cache population (`region`) |
+| `database_cleanup` | Simulates record deletion (`table`) |
+
 ## Registering Custom Handlers
 
 ```go
@@ -191,7 +239,6 @@ sched.Register("send_sms", func(ctx context.Context, task *scheduler.Task) (map[
     phone := task.Payload["phone"].(string)
     msg   := task.Payload["message"].(string)
 
-    // Your implementation here
     err := smsClient.Send(phone, msg)
     if err != nil {
         return nil, err // triggers retry if configured
@@ -201,13 +248,11 @@ sched.Register("send_sms", func(ctx context.Context, task *scheduler.Task) (map[
 })
 ```
 
-## Configuration
+## Scheduler Configuration
 
 ```go
 cfg := scheduler.Config{
-    WorkerCount:     10,              // parallel workers
     PollInterval:    100 * time.Millisecond,
-    MaxQueueSize:    1000,
     ShutdownTimeout: 30 * time.Second,
 }
 ```
@@ -216,8 +261,12 @@ cfg := scheduler.Config{
 
 ```
 distributed-task-scheduler/
-├── main.go               # Entry point, demo tasks, handler registration
+├── main.go               # Entry point and handler registration
 ├── go.mod
+├── Dockerfile
+├── docker-compose.yml
+├── configs/
+│   └── config.yaml       # Port, poll interval, Redis connection
 ├── scheduler/
 │   ├── task.go           # Task model, options, types
 │   ├── queue.go          # Thread-safe priority queue (heap)
@@ -227,17 +276,17 @@ distributed-task-scheduler/
 ├── api/
 │   └── server.go         # HTTP REST API
 ├── storage/
-│   └── store.go          # In-memory + JSON persistence
+│   └── redis_store.go    # Redis-backed TaskStore implementation
 └── examples/
     └── api_test.sh       # cURL demo script
 ```
 
 ## Extension Points
 
-- **Storage**: Implement `scheduler.TaskStore` to use Redis, PostgreSQL, or any backend
 - **Handlers**: Call `sched.Register("type", handler)` for any task type
 - **Hooks**: Use `OnTaskComplete` / `OnTaskFail` for notifications, metrics, etc.
-- **Distribution**: To distribute across nodes, replace the `TaskStore` with a shared backend (Redis/Postgres) and run multiple instances
+- **Storage**: Implement `scheduler.TaskStore` to swap in PostgreSQL or any other backend
+- **Distribution**: Run multiple instances pointing at the same Redis for horizontal scaling
 
 ## Running the Test Script
 

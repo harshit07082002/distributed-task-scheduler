@@ -192,7 +192,7 @@ func (s *Scheduler) Start() error {
 	s.mu.Unlock()
 
 	s.worker.Start()
-	s.recoverPendingTasks()
+	// s.recoverPendingTasks()
 
 	go s.dispatchLoop()
 	go s.resultLoop()
