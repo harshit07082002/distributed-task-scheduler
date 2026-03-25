@@ -15,6 +15,27 @@ import (
 	"github.com/example/task-scheduler/storage"
 )
 
+func initStore(log *slog.Logger) scheduler.TaskStore {
+	host := os.Getenv("REDIS_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	port := os.Getenv("REDIS_PORT")
+	if port == "" {
+		port = "6379"
+	}
+	password := os.Getenv("REDIS_PASSWORD")
+
+	store, err := storage.NewRedisStore(host+":"+port, password, 0)
+	if err != nil {
+		log.Warn("redis unavailable, falling back to memory store", "error", err)
+		mem, _ := storage.NewMemoryStore("data/tasks.json")
+		return mem
+	}
+	log.Info("connected to redis", "addr", host+":"+port)
+	return store
+}
+
 func main() {
 	// ── Logger ──────────────────────────────────────────────────────────
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
@@ -22,11 +43,7 @@ func main() {
 	}))
 
 	// ── Store ────────────────────────────────────────────────────────────
-	store, err := storage.NewMemoryStore("data/tasks.json")
-	if err != nil {
-		log.Error("failed to create store", "error", err)
-		os.Exit(1)
-	}
+	store := initStore(log)
 
 	// ── Scheduler ────────────────────────────────────────────────────────
 	cfg := scheduler.Config{
