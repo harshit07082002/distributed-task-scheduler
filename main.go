@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"log/slog"
 	"math/rand"
 	"os"
@@ -11,48 +12,29 @@ import (
 	"time"
 
 	"github.com/example/task-scheduler/api"
+	config "github.com/example/task-scheduler/configs"
 	"github.com/example/task-scheduler/scheduler"
 	"github.com/example/task-scheduler/storage"
 )
 
-func initStore(log *slog.Logger) scheduler.TaskStore {
-	host := os.Getenv("REDIS_HOST")
-	if host == "" {
-		host = "localhost"
-	}
-	port := os.Getenv("REDIS_PORT")
-	if port == "" {
-		port = "6379"
-	}
-	password := os.Getenv("REDIS_PASSWORD")
-
-	store, err := storage.NewRedisStore(host+":"+port, password, 0)
-	if err != nil {
-		log.Warn("redis unavailable, falling back to memory store", "error", err)
-		mem, _ := storage.NewMemoryStore("data/tasks.json")
-		return mem
-	}
-	log.Info("connected to redis", "addr", host+":"+port)
-	return store
-}
-
 func main() {
-	// ── Logger ──────────────────────────────────────────────────────────
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
 
-	// ── Store ────────────────────────────────────────────────────────────
-	store := initStore(log)
+	if err := config.Initialize(); err != nil {
+		log.Error("failed to initialize config", "error", err)
+		os.Exit(1)
+	}
+
+	redis := initialiseRedis()
 
 	// ── Scheduler ────────────────────────────────────────────────────────
 	cfg := scheduler.Config{
-		WorkerCount:     5,
-		PollInterval:    200 * time.Millisecond,
-		MaxQueueSize:    500,
+		PollInterval:    time.Duration(config.GetConfig().TaskScheduler.PollInterval) * time.Millisecond,
 		ShutdownTimeout: 30 * time.Second,
 	}
-	sched := scheduler.New(cfg, store, log)
+	sched := scheduler.New(cfg, redis, log)
 
 	// ── Register Task Handlers ───────────────────────────────────────────
 	registerHandlers(sched, log)
@@ -80,20 +62,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Submit Demo Tasks ────────────────────────────────────────────────
-	submitDemoTasks(sched, log)
-
+	port := config.GetConfig().TaskScheduler.Port
 	// ── API Server ───────────────────────────────────────────────────────
-	server := api.NewServer(":8080", sched, log)
+	server := api.NewServer(fmt.Sprintf(":%d", port), sched, log)
 	go func() {
-		fmt.Println()
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println("  Distributed Task Scheduler  |  http://localhost:8080")
-		fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		fmt.Println()
-		fmt.Println("API Routes:")
-		fmt.Println(api.RouterInfo())
-		fmt.Println()
+		log.Info("starting API server", "port", port)
 		if err := server.Start(); err != nil {
 			log.Info("server stopped", "reason", err)
 		}
@@ -109,6 +82,25 @@ func main() {
 		log.Warn("server stop error", "error", err)
 	}
 	sched.Stop()
+}
+
+func initialiseRedis() scheduler.TaskStore {
+	host := config.GetConfig().RedisClient.Host
+	if host == "" {
+		host = "localhost"
+	}
+	port := config.GetConfig().RedisClient.Port
+	if port == "" {
+		port = "6379"
+	}
+	password := config.GetConfig().RedisClient.Password
+
+	store, err := storage.NewRedisStore(host+":"+port, password, 0)
+	if err != nil {
+		log.Fatalf("failed to connect to redis at %s: %v", host+":"+port, err)
+	}
+	log.Printf("connected to redis: %s", host+":"+port)
+	return store
 }
 
 // registerHandlers wires task type strings to handler functions
@@ -183,7 +175,7 @@ func registerHandlers(sched *scheduler.Scheduler, log *slog.Logger) {
 		time.Sleep(time.Duration(150+rand.Intn(200)) * time.Millisecond)
 
 		return map[string]any{
-			"table":          table,
+			"table":           table,
 			"records_deleted": deleted,
 		}, nil
 	})

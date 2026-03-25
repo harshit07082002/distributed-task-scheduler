@@ -11,66 +11,83 @@ import (
 // HandlerFunc is the function signature for task handlers
 type HandlerFunc func(ctx context.Context, task *Task) (map[string]any, error)
 
-// Worker represents a single task execution unit
+const workerID = "worker"
+
+// Worker is a single task execution unit
 type Worker struct {
-	id       string
-	taskCh   <-chan *Task
-	resultCh chan<- TaskResult
+	taskCh   chan *Task
+	resultCh chan TaskResult
 	handlers map[string]HandlerFunc
-	quit     chan struct{}
-	wg       *sync.WaitGroup
+	mu       sync.RWMutex
+	wg       sync.WaitGroup
 	log      *slog.Logger
 }
 
-func newWorker(id string, taskCh <-chan *Task, resultCh chan<- TaskResult, handlers map[string]HandlerFunc, wg *sync.WaitGroup, log *slog.Logger) *Worker {
+// NewWorker creates a single worker
+func NewWorker(log *slog.Logger) *Worker {
 	return &Worker{
-		id:       id,
-		taskCh:   taskCh,
-		resultCh: resultCh,
-		handlers: handlers,
-		quit:     make(chan struct{}),
-		wg:       wg,
+		taskCh:   make(chan *Task, 64),
+		resultCh: make(chan TaskResult, 64),
+		handlers: make(map[string]HandlerFunc),
 		log:      log,
 	}
 }
 
-func (w *Worker) start() {
+// Register adds a handler for the given task type
+func (w *Worker) Register(taskType string, fn HandlerFunc) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.handlers[taskType] = fn
+	w.log.Info("handler registered", "task_type", taskType)
+}
+
+// Start launches the worker goroutine
+func (w *Worker) Start() {
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
-		w.log.Info("worker started", "worker_id", w.id)
-		for {
-			select {
-			case task, ok := <-w.taskCh:
-				if !ok {
-					w.log.Info("worker shutting down", "worker_id", w.id)
-					return
-				}
-				result := w.execute(task)
-				w.resultCh <- result
-			case <-w.quit:
-				w.log.Info("worker received quit signal", "worker_id", w.id)
-				return
-			}
+		w.log.Info("worker started", "worker_id", workerID)
+		for task := range w.taskCh {
+			w.resultCh <- w.execute(task)
 		}
+		w.log.Info("worker stopped", "worker_id", workerID)
 	}()
+}
+
+// Submit sends a task to the worker
+func (w *Worker) Submit(task *Task) {
+	w.taskCh <- task
+}
+
+// Results returns the results channel
+func (w *Worker) Results() <-chan TaskResult {
+	return w.resultCh
+}
+
+// Stop gracefully shuts down the worker
+func (w *Worker) Stop() {
+	close(w.taskCh)
+	w.wg.Wait()
+	close(w.resultCh)
 }
 
 func (w *Worker) execute(task *Task) TaskResult {
 	start := time.Now()
 
+	w.mu.RLock()
 	handler, ok := w.handlers[task.Type]
+	w.mu.RUnlock()
+
 	if !ok {
 		return TaskResult{
 			TaskID:   task.ID,
 			Success:  false,
 			Error:    fmt.Errorf("no handler registered for task type %q", task.Type),
 			Duration: time.Since(start),
-			WorkerID: w.id,
+			WorkerID: workerID,
 		}
 	}
 
-	// Set up context with optional timeout
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if task.Timeout > 0 {
@@ -78,14 +95,13 @@ func (w *Worker) execute(task *Task) TaskResult {
 		defer cancel()
 	}
 
-	// Add task info to context
 	ctx = context.WithValue(ctx, contextKeyTaskID, task.ID)
-	ctx = context.WithValue(ctx, contextKeyWorkerID, w.id)
+	ctx = context.WithValue(ctx, contextKeyWorkerID, workerID)
 
 	w.log.Info("executing task",
 		"task_id", task.ID,
 		"task_type", task.Type,
-		"worker_id", w.id,
+		"worker_id", workerID,
 		"priority", task.Priority,
 	)
 
@@ -95,7 +111,7 @@ func (w *Worker) execute(task *Task) TaskResult {
 	if err != nil {
 		w.log.Warn("task failed",
 			"task_id", task.ID,
-			"worker_id", w.id,
+			"worker_id", workerID,
 			"error", err,
 			"duration", duration,
 		)
@@ -104,13 +120,13 @@ func (w *Worker) execute(task *Task) TaskResult {
 			Success:  false,
 			Error:    err,
 			Duration: duration,
-			WorkerID: w.id,
+			WorkerID: workerID,
 		}
 	}
 
 	w.log.Info("task completed",
 		"task_id", task.ID,
-		"worker_id", w.id,
+		"worker_id", workerID,
 		"duration", duration,
 	)
 
@@ -119,77 +135,8 @@ func (w *Worker) execute(task *Task) TaskResult {
 		Success:  true,
 		Result:   result,
 		Duration: duration,
-		WorkerID: w.id,
+		WorkerID: workerID,
 	}
-}
-
-// WorkerPool manages a pool of workers
-type WorkerPool struct {
-	workers  []*Worker
-	taskCh   chan *Task
-	resultCh chan TaskResult
-	handlers map[string]HandlerFunc
-	mu       sync.RWMutex
-	wg       sync.WaitGroup
-	log      *slog.Logger
-	size     int
-}
-
-// NewWorkerPool creates a new worker pool with the given concurrency
-func NewWorkerPool(size int, log *slog.Logger) *WorkerPool {
-	wp := &WorkerPool{
-		taskCh:   make(chan *Task, size*2),
-		resultCh: make(chan TaskResult, size*2),
-		handlers: make(map[string]HandlerFunc),
-		log:      log,
-		size:     size,
-	}
-	return wp
-}
-
-// Register adds a handler for the given task type
-func (wp *WorkerPool) Register(taskType string, fn HandlerFunc) {
-	wp.mu.Lock()
-	defer wp.mu.Unlock()
-	wp.handlers[taskType] = fn
-	wp.log.Info("handler registered", "task_type", taskType)
-}
-
-// Start launches all workers
-func (wp *WorkerPool) Start() {
-	wp.mu.RLock()
-	handlers := wp.handlers
-	wp.mu.RUnlock()
-
-	for i := 0; i < wp.size; i++ {
-		id := fmt.Sprintf("worker-%03d", i+1)
-		w := newWorker(id, wp.taskCh, wp.resultCh, handlers, &wp.wg, wp.log)
-		wp.workers = append(wp.workers, w)
-		w.start()
-	}
-	wp.log.Info("worker pool started", "size", wp.size)
-}
-
-// Submit sends a task to an available worker
-func (wp *WorkerPool) Submit(task *Task) {
-	wp.taskCh <- task
-}
-
-// Results returns the results channel
-func (wp *WorkerPool) Results() <-chan TaskResult {
-	return wp.resultCh
-}
-
-// Stop gracefully shuts down the worker pool
-func (wp *WorkerPool) Stop() {
-	close(wp.taskCh)
-	wp.wg.Wait()
-	close(wp.resultCh)
-}
-
-// ActiveWorkers returns the number of configured workers
-func (wp *WorkerPool) ActiveWorkers() int {
-	return len(wp.workers)
 }
 
 // context keys

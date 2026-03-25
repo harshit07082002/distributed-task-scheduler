@@ -11,37 +11,31 @@ import (
 
 // Config holds scheduler configuration
 type Config struct {
-	WorkerCount    int
-	PollInterval   time.Duration
-	MaxQueueSize   int
+	PollInterval    time.Duration
 	ShutdownTimeout time.Duration
 }
 
 // DefaultConfig returns a sensible default configuration
 func DefaultConfig() Config {
 	return Config{
-		WorkerCount:     5,
 		PollInterval:    100 * time.Millisecond,
-		MaxQueueSize:    1000,
 		ShutdownTimeout: 30 * time.Second,
 	}
 }
 
 // Scheduler is the main orchestrator
 type Scheduler struct {
-	config  Config
-	queue   *TaskQueue
-	pool    *WorkerPool
-	store   TaskStore
-	log     *slog.Logger
+	config Config
+	worker *Worker
+	store  TaskStore
+	log    *slog.Logger
 
 	mu       sync.RWMutex
-	cronJobs map[string]*CronSchedule // taskID -> parsed cron
+	cronJobs map[string]*CronSchedule
 	running  bool
 	quit     chan struct{}
 	done     chan struct{}
 
-	// Event hooks
 	onTaskComplete []func(task *Task, result TaskResult)
 	onTaskFail     []func(task *Task, err error)
 }
@@ -53,14 +47,17 @@ type TaskStore interface {
 	GetAll() ([]*Task, error)
 	Delete(id string) error
 	GetByStatus(status TaskStatus) ([]*Task, error)
+	// Enqueue adds a task to the scheduled queue (score = ScheduledAt)
+	Enqueue(task *Task) error
+	// PopDue atomically removes and returns the earliest task due by now; nil if none
+	PopDue(now time.Time) (*Task, error)
 }
 
 // New creates a new Scheduler instance
 func New(cfg Config, store TaskStore, log *slog.Logger) *Scheduler {
 	return &Scheduler{
 		config:   cfg,
-		queue:    NewTaskQueue(),
-		pool:     NewWorkerPool(cfg.WorkerCount, log),
+		worker:   NewWorker(log),
 		store:    store,
 		log:      log,
 		cronJobs: make(map[string]*CronSchedule),
@@ -71,7 +68,7 @@ func New(cfg Config, store TaskStore, log *slog.Logger) *Scheduler {
 
 // Register adds a handler for a task type
 func (s *Scheduler) Register(taskType string, fn HandlerFunc) {
-	s.pool.Register(taskType, fn)
+	s.worker.Register(taskType, fn)
 }
 
 // OnTaskComplete adds a hook called when a task succeeds
@@ -84,7 +81,7 @@ func (s *Scheduler) OnTaskFail(fn func(task *Task, err error)) {
 	s.onTaskFail = append(s.onTaskFail, fn)
 }
 
-// Submit creates and enqueues a new task
+// Submit creates and saves a new task to the store
 func (s *Scheduler) Submit(name, taskType string, payload map[string]any, opts ...TaskOption) (*Task, error) {
 	task := &Task{
 		ID:           uuid.New().String(),
@@ -103,7 +100,6 @@ func (s *Scheduler) Submit(name, taskType string, payload map[string]any, opts .
 		opt(task)
 	}
 
-	// Parse cron if recurring
 	if task.IsRecurring && task.CronExpr != "" {
 		cron, err := ParseCron(task.CronExpr)
 		if err != nil {
@@ -118,7 +114,6 @@ func (s *Scheduler) Submit(name, taskType string, payload map[string]any, opts .
 		task.NextRunAt = &next
 	}
 
-	// Check dependencies are met
 	if err := s.checkDependencies(task); err != nil {
 		return nil, err
 	}
@@ -126,8 +121,10 @@ func (s *Scheduler) Submit(name, taskType string, payload map[string]any, opts .
 	if err := s.store.Save(task); err != nil {
 		return nil, fmt.Errorf("failed to save task: %w", err)
 	}
+	if err := s.store.Enqueue(task); err != nil {
+		return nil, fmt.Errorf("failed to enqueue task: %w", err)
+	}
 
-	s.queue.Push(task)
 	s.log.Info("task submitted",
 		"task_id", task.ID,
 		"task_name", task.Name,
@@ -174,15 +171,13 @@ func (s *Scheduler) Stats() map[string]any {
 		counts[t.Status]++
 	}
 	return map[string]any{
-		"queue_depth":   s.queue.Len(),
-		"worker_count":  s.config.WorkerCount,
-		"total_tasks":   len(all),
-		"pending":       counts[StatusPending],
-		"running":       counts[StatusRunning],
-		"completed":     counts[StatusCompleted],
-		"failed":        counts[StatusFailed],
-		"retrying":      counts[StatusRetrying],
-		"cancelled":     counts[StatusCancelled],
+		"total_tasks": len(all),
+		"pending":     counts[StatusPending],
+		"running":     counts[StatusRunning],
+		"completed":   counts[StatusCompleted],
+		"failed":      counts[StatusFailed],
+		"retrying":    counts[StatusRetrying],
+		"cancelled":   counts[StatusCancelled],
 	}
 }
 
@@ -196,21 +191,13 @@ func (s *Scheduler) Start() error {
 	s.running = true
 	s.mu.Unlock()
 
-	s.pool.Start()
-
-	// Recover pending tasks from store
+	s.worker.Start()
 	s.recoverPendingTasks()
 
-	// Start dispatch loop
 	go s.dispatchLoop()
-
-	// Start result handler
 	go s.resultLoop()
 
-	s.log.Info("scheduler started",
-		"workers", s.config.WorkerCount,
-		"poll_interval", s.config.PollInterval,
-	)
+	s.log.Info("scheduler started", "poll_interval", s.config.PollInterval)
 	return nil
 }
 
@@ -219,11 +206,11 @@ func (s *Scheduler) Stop() {
 	s.log.Info("scheduler shutting down...")
 	close(s.quit)
 	<-s.done
-	s.pool.Stop()
+	s.worker.Stop()
 	s.log.Info("scheduler stopped")
 }
 
-// dispatchLoop polls the queue and dispatches tasks to workers
+// dispatchLoop polls Redis on every tick
 func (s *Scheduler) dispatchLoop() {
 	ticker := time.NewTicker(s.config.PollInterval)
 	defer ticker.Stop()
@@ -233,43 +220,40 @@ func (s *Scheduler) dispatchLoop() {
 		case <-s.quit:
 			close(s.done)
 			return
-
-		case <-s.queue.Notify():
-			s.dispatch()
-
 		case <-ticker.C:
 			s.dispatch()
 		}
 	}
 }
 
+// dispatch atomically pops the earliest due task from the queue and sends it to the worker
 func (s *Scheduler) dispatch() {
-	for {
-		task := s.queue.Pop()
-		if task == nil {
-			break
-		}
-
-		// Skip cancelled tasks
-		stored, err := s.store.Get(task.ID)
-		if err != nil || stored.Status == StatusCancelled {
-			continue
-		}
-
-		now := time.Now()
-		stored.Status = StatusRunning
-		stored.StartedAt = &now
-		stored.WorkerID = ""
-		stored.UpdatedAt = now
-		_ = s.store.Save(stored)
-
-		s.pool.Submit(stored)
+	task, err := s.store.PopDue(time.Now())
+	if err != nil {
+		s.log.Error("failed to pop due task", "error", err)
+		return
 	}
+	if task == nil {
+		return
+	}
+
+	now := time.Now()
+	task.Status = StatusRunning
+	task.StartedAt = &now
+	task.WorkerID = workerID
+	task.UpdatedAt = now
+	if err := s.store.Save(task); err != nil {
+		s.log.Error("failed to mark task as running", "task_id", task.ID, "error", err)
+		_ = s.store.Enqueue(task) // put back on failure
+		return
+	}
+
+	s.worker.Submit(task)
 }
 
-// resultLoop processes results from workers
+// resultLoop processes results from the worker
 func (s *Scheduler) resultLoop() {
-	for result := range s.pool.Results() {
+	for result := range s.worker.Results() {
 		s.handleResult(result)
 	}
 }
@@ -290,7 +274,6 @@ func (s *Scheduler) handleResult(result TaskResult) {
 		task.CompletedAt = &now
 		task.Result = result.Result
 
-		// Reschedule recurring tasks
 		if task.IsRecurring {
 			s.reschedule(task)
 		}
@@ -301,9 +284,8 @@ func (s *Scheduler) handleResult(result TaskResult) {
 	} else {
 		if task.CanRetry() {
 			task.RetryCount++
-			task.Status = StatusRetrying
-			delay := task.nextRetryDelay()
-			retryAt := now.Add(delay)
+			task.Status = StatusPending
+			retryAt := now.Add(task.nextRetryDelay())
 			task.ScheduledAt = retryAt
 			task.Error = result.Error.Error()
 
@@ -315,10 +297,7 @@ func (s *Scheduler) handleResult(result TaskResult) {
 			)
 
 			_ = s.store.Save(task)
-			// Re-queue with updated schedule
-			retryTask := *task
-			retryTask.Status = StatusPending
-			s.queue.Push(&retryTask)
+			_ = s.store.Enqueue(task)
 			return
 		}
 
@@ -334,12 +313,11 @@ func (s *Scheduler) handleResult(result TaskResult) {
 	_ = s.store.Save(task)
 }
 
-// reschedule sets up the next run for a recurring task
+// reschedule saves the next run of a recurring task to Redis
 func (s *Scheduler) reschedule(task *Task) {
 	s.mu.RLock()
 	cron, ok := s.cronJobs[task.ID]
 	s.mu.RUnlock()
-
 	if !ok {
 		return
 	}
@@ -364,7 +342,7 @@ func (s *Scheduler) reschedule(task *Task) {
 	s.mu.Unlock()
 
 	_ = s.store.Save(&newTask)
-	s.queue.Push(&newTask)
+	_ = s.store.Enqueue(&newTask)
 
 	s.log.Info("recurring task rescheduled",
 		"task_id", newTask.ID,
@@ -373,7 +351,7 @@ func (s *Scheduler) reschedule(task *Task) {
 	)
 }
 
-// recoverPendingTasks re-queues tasks that were in-flight when scheduler stopped
+// recoverPendingTasks resets any running tasks to pending on startup
 func (s *Scheduler) recoverPendingTasks() {
 	pending, _ := s.store.GetByStatus(StatusPending)
 	retrying, _ := s.store.GetByStatus(StatusRetrying)
@@ -382,12 +360,10 @@ func (s *Scheduler) recoverPendingTasks() {
 	tasks := append(append(pending, retrying...), running...)
 	for _, t := range tasks {
 		if t.Status == StatusRunning {
-			// Re-queue as pending
 			t.Status = StatusPending
 			t.StartedAt = nil
 			_ = s.store.Save(t)
 		}
-		// Re-parse cron if recurring
 		if t.IsRecurring && t.CronExpr != "" {
 			if cron, err := ParseCron(t.CronExpr); err == nil {
 				s.mu.Lock()
@@ -395,7 +371,7 @@ func (s *Scheduler) recoverPendingTasks() {
 				s.mu.Unlock()
 			}
 		}
-		s.queue.Push(t)
+		_ = s.store.Enqueue(t)
 	}
 
 	if len(tasks) > 0 {

@@ -4,10 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/example/task-scheduler/scheduler"
 	"github.com/redis/go-redis/v9"
 )
+
+const scheduledQueueKey = "tasks:scheduled_queue"
+
+// popDueScript atomically gets and removes the earliest task with score <= now
+var popDueScript = redis.NewScript(`
+	local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)
+	if #items == 0 then return nil end
+	redis.call('ZREM', KEYS[1], items[1])
+	return items[1]
+`)
 
 const (
 	taskKeyPrefix = "task:"
@@ -103,6 +115,31 @@ func (r *RedisStore) GetByStatus(status scheduler.TaskStatus) ([]*scheduler.Task
 		return nil, err
 	}
 	return r.fetchTasks(ids)
+}
+
+// Enqueue adds a task to the sorted set with score = ScheduledAt nanoseconds
+func (r *RedisStore) Enqueue(task *scheduler.Task) error {
+	return r.client.ZAdd(r.ctx, scheduledQueueKey, redis.Z{
+		Score:  float64(task.ScheduledAt.UnixNano()),
+		Member: task.ID,
+	}).Err()
+}
+
+// PopDue atomically removes and returns the earliest task due by now; nil if none ready
+func (r *RedisStore) PopDue(now time.Time) (*scheduler.Task, error) {
+	maxScore := strconv.FormatInt(now.UnixNano(), 10)
+	result, err := popDueScript.Run(r.ctx, r.client, []string{scheduledQueueKey}, maxScore).Result()
+	if err == redis.Nil || result == nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	id, ok := result.(string)
+	if !ok {
+		return nil, nil
+	}
+	return r.Get(id)
 }
 
 // fetchTasks retrieves multiple tasks by ID in a single pipeline

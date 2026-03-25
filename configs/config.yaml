@@ -1,0 +1,10 @@
+task-scheduler:
+  port: 8080
+  name: "task-scheduler"
+  poll_interval: 200
+
+redis_client:
+  host: "localhost"
+  port: "6379"
+  db: 0
+  password: ""
